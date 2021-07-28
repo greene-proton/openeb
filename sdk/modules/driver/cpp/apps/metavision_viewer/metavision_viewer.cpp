@@ -11,6 +11,10 @@
 
 // Example of using Metavision SDK Driver API for visualizing events stream.
 
+#include <time.h>
+#include <stdlib.h>
+#include <stdio.h>
+
 #include <iostream>
 #include <boost/program_options.hpp>
 #include <metavision/sdk/driver/camera.h>
@@ -27,6 +31,8 @@ static const int ESCAPE = 27;
 static const int SPACE  = 32;
 
 namespace po = boost::program_options;
+
+std::string get_str_time(void);
 
 int process_ui_for(int delay_ms) {
     auto then = std::chrono::high_resolution_clock::now();
@@ -66,12 +72,30 @@ int setup_cd_callback_and_window(Metavision::Camera &camera, cv::Mat &cd_frame,
     return id;
 }
 
+std::string get_str_time()
+{
+    time_t rawtime;
+    struct tm * timeinfo;
+    char buffer [80];
+
+    time(&rawtime);
+    timeinfo = localtime(&rawtime);
+
+    strftime(buffer, 80, "%Y%m%d-%H%M%S", timeinfo);
+    puts(buffer);
+    return buffer;
+}
+
 int main(int argc, char *argv[]) {
     std::string serial;
     std::string biases_file;
     std::string in_raw_file_path;
     std::string out_raw_file_path;
     std::vector<uint16_t> roi;
+    std::string str_time = get_str_time();
+    std::string raw_filepath_w_date = ("%s-data.raw", str_time.c_str());
+    std::cout << raw_filepath_w_date << std::endl;
+    bool record_only;
 
     bool do_retry = false;
 
@@ -90,8 +114,9 @@ int main(int argc, char *argv[]) {
         ("serial,s",          po::value<std::string>(&serial),"Serial ID of the camera. This flag is incompatible with flag '--input-raw-file'.")
         ("input-raw-file,i",  po::value<std::string>(&in_raw_file_path), "Path to input RAW file. If not specified, the camera live stream is used.")
         ("biases,b",          po::value<std::string>(&biases_file), "Path to a biases file. If not specified, the camera will be configured with the default biases.")
-        ("output-raw-file,o", po::value<std::string>(&out_raw_file_path)->default_value("data.raw"), "Path to an output RAW file used for data recording. Default value is 'data.raw'. It also works when reading data from a RAW file.")
+        ("output-raw-file,o", po::value<std::string>(&out_raw_file_path)->default_value(raw_filepath_w_date), "Path to an output RAW file used for data recording. Default value is 'data.raw'. It also works when reading data from a RAW file.")
         ("roi,r",             po::value<std::vector<uint16_t>>(&roi)->multitoken(), "Hardware ROI to set on the sensor in the format [x y width height].")
+        ("record-only,g",     po::bool_switch(&record_only)->default_value(false), "Record only, do not show display")
     ;
     // clang-format on
 
@@ -177,16 +202,21 @@ int main(int argc, char *argv[]) {
             MV_LOG_ERROR() << e.what();
             do_retry = true;
         });
-
+            
         // Get the geometry of the camera
         auto &geometry = camera.geometry(); // Get the geometry of the camera
 
-        // All cameras have CDs events
+        int cd_events_cb_id = 0;
         std::string cd_window_name("CD Events");
         cv::Mat cd_frame;
         Metavision::CDFrameGenerator cd_frame_generator(geometry.width(), geometry.height());
         cd_frame_generator.set_display_accumulation_time_us(10000);
-        int cd_events_cb_id = setup_cd_callback_and_window(camera, cd_frame, cd_frame_generator, cd_window_name);
+
+        if (!record_only){
+
+            // All cameras have CDs events
+            cd_events_cb_id = setup_cd_callback_and_window(camera, cd_frame, cd_frame_generator, cd_window_name);
+        }
 
         // Start the camera streaming
         camera.start();
@@ -194,48 +224,75 @@ int main(int argc, char *argv[]) {
         bool recording  = false;
         bool is_roi_set = true;
 
-        while (camera.is_running()) {
-            if (!cd_frame.empty()) {
-                cv::imshow(cd_window_name, cd_frame);
+        if (record_only)
+        {
+            if (!recording) {
+                camera.start_recording(out_raw_file_path);
+                recording = true;
+            } else {
+                camera.stop_recording();
             }
-
-            // Wait for a pressed key for 33ms, that means that the display is refreshed at 30 FPS
-            int key = process_ui_for(33);
-            switch (key) {
-            case 'q':
-            case ESCAPE:
-                camera.stop();
-                do_retry = false;
-                break;
-            case SPACE:
-                if (!recording) {
-                    camera.start_recording(out_raw_file_path);
-                } else {
-                    camera.stop_recording();
+        }
+        MV_LOG_INFO() << (recording ? "true":"false");
+        while (camera.is_running()) {
+            if (!record_only)
+            {
+                if (!cd_frame.empty()) {
+                    cv::imshow(cd_window_name, cd_frame);
                 }
-                recording = !recording;
-                break;
-            case 'r': {
-                if (roi.size() == 0) {
+                // Wait for a pressed key for 33ms, that means that the display is refreshed at 30 FPS
+                int key = process_ui_for(33);
+                switch (key) {
+                case 'q':
+                    if (recording) {
+                        camera.stop_recording();
+                        recording = false;
+                    }
+                case ESCAPE:
+                    camera.stop();
+                    do_retry = false;
+                    break;
+                case SPACE:
+                    if (!recording) {
+                        camera.start_recording(out_raw_file_path);
+                    } else {
+                        camera.stop_recording();
+                    }
+                    recording = !recording;
+                    break;
+                case 'r': {
+                    if (roi.size() == 0) {
+                        break;
+                    }
+                    if (!is_roi_set) {
+                        camera.roi().set({roi[0], roi[1], roi[2], roi[3]});
+                    } else {
+                        camera.roi().unset();
+                    }
+                    is_roi_set = !is_roi_set;
                     break;
                 }
-                if (!is_roi_set) {
-                    camera.roi().set({roi[0], roi[1], roi[2], roi[3]});
-                } else {
-                    camera.roi().unset();
+                case 'h':
+                    MV_LOG_INFO() << long_program_desc;
+                    break;
+                default:
+                    break;
                 }
-                is_roi_set = !is_roi_set;
-                break;
             }
-            case 'h':
-                MV_LOG_INFO() << long_program_desc;
-                break;
-            default:
-                break;
+            else
+            {
+                // Wait for a pressed key for 33ms, that means that the display is refreshed at 30 FPS
+                int key = process_ui_for(33);
+                switch (key) {
+                case 'q':
+                    if (recording) {
+                        camera.stop_recording();
+                        recording = false;
+                    }
+                }
             }
         }
 
-        // unregister callbacks to make sure they are not called anymore
         if (cd_events_cb_id >= 0) {
             camera.cd().remove_callback(cd_events_cb_id);
         }
